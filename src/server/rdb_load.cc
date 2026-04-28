@@ -2257,8 +2257,7 @@ error_code RdbLoader::Load(io::Source* src) {
           return RdbError(errc::rdb_chunk_payload_remaining);
         }
 
-        if (!stream_states_.empty())
-          LOG(ERROR) << "eof seen while pending stream states: " << stream_states_.size();
+        LOG(ERROR) << "eof seen while pending stream states: " << stream_states_.size();
         return RdbError(errc::rdb_chunk_payload_remaining);
       }
       /* EOF: End of file, exit the main loop. */
