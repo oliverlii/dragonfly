@@ -2187,6 +2187,12 @@ error_code RdbLoader::Load(io::Source* src) {
     GetCurrentDbSlice().IncrLoadInProgress();
   }
 
+  auto finalize_curr_chunk = [&] {
+    if (!stop_early_.load(memory_order_relaxed))
+      return FinishCurrentChunk();
+    return kOk;
+  };
+
   while (!stop_early_.load(memory_order_relaxed)) {
     if (pause_) {
       ThisFiber::SleepFor(100ms);
@@ -2397,14 +2403,7 @@ error_code RdbLoader::Load(io::Source* src) {
       // path below will read its type and key.
       if (stream_states_.contains(current_chunk_state_->stream_id)) {
         RETURN_ON_ERR(LoadValueChunk());
-        if (!stop_early_.load(memory_order_relaxed) &&
-            current_chunk_state_->remaining_payload_bytes != 0) {
-          LOG(ERROR) << "chunk fully consumed but payload bytes remain "
-                     << current_chunk_state_->remaining_payload_bytes;
-          return RdbError(errc::rdb_chunk_payload_remaining);
-        }
-        // This chunk is fully consumed, clear the state
-        current_chunk_state_.reset();
+        RETURN_ON_ERR(finalize_curr_chunk());
       }
       continue;
     }
@@ -2425,16 +2424,7 @@ error_code RdbLoader::Load(io::Source* src) {
     VLOG(2) << "LoadKeyValPair key=" << last_key_loaded_ << " rdb_type=" << type
             << " db= " << cur_db_index_;
     settings.Reset();
-    if (!stop_early_.load(memory_order_relaxed) && current_chunk_state_ &&
-        current_chunk_state_->remaining_payload_bytes != 0) {
-      LOG(ERROR) << "chunk fully consumed but payload bytes remain "
-                 << current_chunk_state_->remaining_payload_bytes;
-      return RdbError(errc::rdb_chunk_payload_remaining);
-    }
-
-    // If we just read the first chunk of a key, then reset state here because LoadKeyValPair will
-    // only return when the chunk finishes
-    current_chunk_state_.reset();
+    RETURN_ON_ERR(finalize_curr_chunk());
   }  // main load loop
 
   DVLOG(1) << "RdbLoad loop finished";
@@ -2633,12 +2623,7 @@ error_code RdbLoaderBase::HandleCompressedBlob(int op_type) {
   // Stop counting payload bytes on decompressed data. At this point the entire payload size must be
   // consumed as it was the compressed blob. We switch to another buffer and must be able to read
   // everything from it without any checks
-  if (current_chunk_state_ && current_chunk_state_->remaining_payload_bytes > 0) {
-    LOG(ERROR) << "Compressed blob not fully consumed, remaining bytes "
-               << current_chunk_state_->remaining_payload_bytes;
-    return RdbError(errc::rdb_chunk_payload_remaining);
-  }
-  current_chunk_state_.reset();
+  FinishCurrentChunk();
 
   // Decompress blob and switch membuf pointer
   // Last type in the compressed blob is RDB_OPCODE_COMPRESSED_BLOB_END
@@ -2851,6 +2836,20 @@ std::error_code RdbLoaderBase::FromOpaque(const OpaqueObj& opaque, LoadConfig co
   std::visit(visitor, opaque.obj);
 
   return visitor.ec();
+}
+
+std::error_code RdbLoaderBase::FinishCurrentChunk() {
+  if (!current_chunk_state_)
+    return kOk;
+
+  if (!ChunkBudgetExhausted()) {
+    LOG(ERROR) << "chunk fully consumed but payload bytes remain "
+               << current_chunk_state_->remaining_payload_bytes;
+    return RdbError(errc::rdb_chunk_payload_remaining);
+  }
+
+  current_chunk_state_.reset();
+  return kOk;
 }
 
 void RdbLoaderBase::CopyStreamId(const StreamID& src, struct streamID* dest) {
