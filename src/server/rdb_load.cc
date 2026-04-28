@@ -3010,21 +3010,23 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
   // If the first tagged chunk did not finish the object, save enough state to resume it when
   // the next chunk with the same stream id arrives.
   if (!finalized && current_chunk_state_) {
-    if (stream_states_.contains(current_chunk_state_->stream_id)) {
-      LOG(ERROR) << "attempt to add first chunk for id " << current_chunk_state_->stream_id
-                 << " which already exists";
-      return RdbError(errc::rdb_file_corrupted);
-    }
-    stream_states_[current_chunk_state_->stream_id] = {
+    StreamState stream_state{
         .db_index = cur_db_index_,
         .type = type,
         .pending_read = pending_read_,
         .settings = *settings,
         .key = std::move(key),
     };
+    const bool inserted =
+        stream_states_.try_emplace(current_chunk_state_->stream_id, std::move(stream_state)).second;
+    if (!inserted) {
+      LOG(ERROR) << "attempt to add first chunk for id " << current_chunk_state_->stream_id
+                 << " which already exists";
+      return RdbError(errc::rdb_file_corrupted);
+    }
   }
 
-  int delta_ms = (absl::GetCurrentTimeNanos() - start) / 1000'000;
+  const int delta_ms = (absl::GetCurrentTimeNanos() - start) / 1000'000;
   LOG_IF(INFO, delta_ms > 1000) << "Took " << delta_ms << " ms to load rdb_type " << type;
 
   pending_read_ = {};
